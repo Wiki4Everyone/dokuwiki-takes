@@ -1,0 +1,11 @@
+ALTER TABLE take_slot ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE take_slot ADD COLUMN down_notified INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE take_alert (
+    login TEXT NOT NULL,
+    page TEXT NOT NULL,
+    threshold INTEGER NOT NULL,
+    hit_up INTEGER NOT NULL DEFAULT 0,
+    hit_top INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (login, page)
+);
