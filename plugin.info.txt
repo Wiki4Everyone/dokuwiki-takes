@@ -1,6 +1,6 @@
 base   takes
 author Wiki4Everyone
-email  noreply@f67.uk
+email  wiki4everyone@gmail.com
 date   2026-11-23
 name   Takes
 desc   Numbered versions and votes for a hot page
