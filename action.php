@@ -9,7 +9,7 @@ class action_plugin_takes extends ActionPlugin
     private $move = null;
     private $writing = false;
     private const CAP = 1000000000;
-    private const MAX_N = 60000;
+    private const MAX_N = 100000000;
     public function register(EventHandler $controller)
     {
         $controller->register_hook('ACTION_ACT_PREPROCESS', 'BEFORE', $this, 'onPre');
@@ -62,7 +62,7 @@ class action_plugin_takes extends ActionPlugin
         $act = $this->actName($event->data);
         $id = $this->pageId();
         $user = $this->user();
-        if (($act === 'show' || $act === '') && $this->buriedFor($id, $user)) {
+        if (($act === 'show' || $act === '') && ($this->buriedFor($id, $user) || $this->privateFor($id, $user))) {
             http_status(404);
         }
         if (!in_array($act, ['edit', 'preview', 'save', 'recover', 'draft', 'revert'], true)) return;
@@ -82,7 +82,7 @@ class action_plugin_takes extends ActionPlugin
         $part = $this->split($id);
         if ($part && $this->marked($part['base'])) {
             $event->data = $this->versionBanner($part) . $event->data;
-            if ($this->buriedFor($id, $this->user())) {
+            if ($this->buriedFor($id, $this->user()) || $this->privateFor($id, $this->user())) {
                 $event->data = '<h1>' . hsc($this->tx($this->lang($id), 'missing')) . '</h1>';
             }
             return;
@@ -120,14 +120,15 @@ class action_plugin_takes extends ActionPlugin
 
     public function onSaved(Event $event, $param)
     {
-        if (!$this->move || !$event->mayRunDefault()) {
+        if ($this->move && $event->mayRunDefault()) {
+            $base = $this->move['base'];
+            $body = $this->move['body'];
             $this->move = null;
-            return;
+            $this->migrate($base, $body);
+        } else {
+            $this->move = null;
         }
-        $base = $this->move['base'];
-        $body = $this->move['body'];
-        $this->move = null;
-        $this->migrate($base, $body);
+        if ($event->mayRunDefault()) $this->markPublic($event);
     }
 
     public function onAcl(Event $event, $param)
@@ -166,7 +167,6 @@ class action_plugin_takes extends ActionPlugin
         foreach ($names as $name) {
             if (!is_string($name) || $name === '') continue;
             $db->query('DELETE FROM take_vote WHERE login = ?', $name);
-            $db->query('DELETE FROM take_slot WHERE login = ?', $name);
             $db->query('DELETE FROM take_alert WHERE login = ?', $name);
         }
     }
@@ -199,7 +199,11 @@ class action_plugin_takes extends ActionPlugin
     private function ensurePage($page, $lang)
     {
         if ($page === '' || page_exists($page)) return;
-        $this->writeTxt($page, $this->tx($lang, 'stub') . "\n");
+        $part = $this->split($page);
+        $base = $part ? $part['base'] : '';
+        $this->writeTxt($page, $this->notice($base) . "\n");
+        $db = $this->db();
+        if ($db) $db->query('UPDATE take_slot SET public = 0, title = ?, snippet = ? WHERE page = ?', '', '', $page);
     }
 
     private function baseLocked($id, $user)
@@ -285,8 +289,9 @@ class action_plugin_takes extends ActionPlugin
         $html .= '<ol class="takes-list">';
         foreach ($rows as $row) {
             $page = $row['page'];
-            $title = p_get_first_heading($page);
-            if (!$title) $title = noNS($page);
+            $title = (string) ($row['title'] ?? '');
+            if ($title === '') $title = (string) p_get_first_heading($page);
+            if ($title === '') $title = noNS($page);
             $mineVote = (int) ($row['votes'][$user] ?? 0);
             $html .= '<li class="takes-item">';
             $html .= '<div class="takes-row">';
@@ -301,6 +306,9 @@ class action_plugin_takes extends ActionPlugin
             }
             if (!empty($row['hidden'])) {
                 $html .= '<p class="takes-note">' . hsc($this->tx($lang, 'hidden')) . '</p>';
+            }
+            if (empty($row['public'])) {
+                $html .= '<p class="takes-note">' . hsc($this->tx($lang, 'private')) . '</p>';
             }
             if ($user !== '') {
                 $html .= '<div class="takes-row">';
@@ -331,7 +339,7 @@ class action_plugin_takes extends ActionPlugin
     {
         $db = $this->db();
         if (!$db) return [];
-        $slots = $db->res2arr($db->query('SELECT page, n, login, hidden FROM take_slot WHERE base = ?', $base));
+        $slots = $db->res2arr($db->query('SELECT page, n, login, hidden, public, title, snippet FROM take_slot WHERE base = ?', $base));
         $voteRows = $db->res2arr($db->query(
             'SELECT v.page, v.login, v.vote FROM take_vote v JOIN take_slot s ON s.page = v.page WHERE s.base = ?',
             $base
@@ -344,21 +352,34 @@ class action_plugin_takes extends ActionPlugin
         foreach ($slots as $slot) {
             $page = (string) $slot['page'];
             if (!page_exists($page)) continue;
+            if ((int) ($slot['public'] ?? 0) !== 1 && $slot['login'] !== $user) continue;
             if ((int) ($slot['hidden'] ?? 0) === 1 && $slot['login'] !== $user) continue;
             $votes = $byPage[$page] ?? [];
             $ups = 0;
             foreach ($votes as $vote) {
                 if ($vote > 0) $ups += $vote;
             }
+            $snippet = (string) ($slot['snippet'] ?? '');
+            $title = (string) ($slot['title'] ?? '');
+            if ($snippet === '' || $title === '') {
+                $snippet = $this->snippet($page);
+                $got = p_get_first_heading($page);
+                if (is_string($got) && $got !== '') $title = $got;
+                if ($title === '') $title = noNS($page);
+                if ($snippet === '') $snippet = noNS($page);
+                $db->query('UPDATE take_slot SET title = ?, snippet = ? WHERE page = ?', $title, $snippet, $page);
+            }
             $rows[] = [
                 'page' => $page,
                 'n' => (int) $slot['n'],
                 'login' => (string) $slot['login'],
                 'hidden' => (int) ($slot['hidden'] ?? 0),
+                'public' => (int) ($slot['public'] ?? 0),
+                'title' => $title,
                 'score' => array_sum($votes),
                 'ups' => $ups,
                 'votes' => $votes,
-                'snippet' => $this->snippet($page),
+                'snippet' => $snippet,
             ];
         }
         usort($rows, function ($a, $b) {
@@ -411,7 +432,7 @@ class action_plugin_takes extends ActionPlugin
     {
         $db = $this->db();
         if (!$db || $page === '') return null;
-        $row = $db->res2row($db->query('SELECT base, n, page, login, hidden, down_notified FROM take_slot WHERE page = ?', $page));
+        $row = $db->res2row($db->query('SELECT base, n, page, login, hidden, down_notified, public FROM take_slot WHERE page = ?', $page));
         return $row ?: null;
     }
 
@@ -471,6 +492,7 @@ class action_plugin_takes extends ActionPlugin
             );
             $text = $body === '' ? $this->tx($lang, 'empty0') : $body;
             $this->writeTxt($page0, $text);
+            $db->query('UPDATE take_slot SET public = 1 WHERE page = ?', $page0);
         }
         $n = 0;
         $row = $this->db()->res2row($this->db()->query('SELECT COALESCE(MAX(n), 0) AS n FROM take_slot WHERE base = ? AND n > 0', $base));
@@ -495,7 +517,7 @@ class action_plugin_takes extends ActionPlugin
             } catch (Throwable $e) {
                 $ok = false;
             }
-            if ($ok) $this->writeTxt($page, $this->tx($lang, 'stub'));
+            if ($ok) $this->writeTxt($page, $this->notice($base));
         }
     }
 
@@ -703,6 +725,58 @@ class action_plugin_takes extends ActionPlugin
         return true;
     }
 
+    private function privateFor($id, $user)
+    {
+        $part = $this->split($id);
+        if (!$part || (int) $part['n'] === 0 || !$this->marked($part['base'])) return false;
+        $slot = $this->slotByPage($id);
+        if (!$slot || (int) ($slot['public'] ?? 0) === 1) return false;
+        if ($user !== '' && $slot['login'] === $user) return false;
+        if ($this->isAdmin($user)) return false;
+        return true;
+    }
+
+    private function notice($base)
+    {
+        return sprintf($this->tx($this->lang($base), 'stub'), $base . '.0');
+    }
+
+    private function sameAsNotice($text, $base)
+    {
+        $flat = function ($s) {
+            return trim(preg_replace('/\s+/u', ' ', (string) $s));
+        };
+        return $flat($text) === $flat($this->notice($base));
+    }
+
+    private function markPublic(Event $event)
+    {
+        $id = cleanID((string) ($event->data['id'] ?? ''));
+        $part = $this->split($id);
+        if (!$part || (int) $part['n'] === 0) return;
+        $user = $this->user();
+        $slot = $this->slotByPage($id);
+        if (!$slot || $user === '' || $slot['login'] !== $user) return;
+        $db = $this->db();
+        if (!$db) return;
+        $new = trim((string) ($event->data['newContent'] ?? ''));
+        if ($new === '' || $this->sameAsNotice($new, $part['base'])) {
+            $db->query('UPDATE take_slot SET public = 0, title = ?, snippet = ? WHERE page = ?', '', '', $id);
+            return;
+        }
+        $title = '';
+        if (page_exists($id)) {
+            $got = p_get_first_heading($id);
+            if (is_string($got)) $title = $got;
+        }
+        $db->query(
+            'UPDATE take_slot SET public = 1, title = ?, snippet = ? WHERE page = ?',
+            $title,
+            page_exists($id) ? $this->snippet($id) : '',
+            $id
+        );
+    }
+
     private function isStaff($user)
     {
         global $INFO, $auth;
@@ -777,12 +851,13 @@ class action_plugin_takes extends ActionPlugin
                 'up' => 'Up', 'down' => 'Down', 'empty' => 'No versions yet.',
                 'taken' => 'This version belongs to someone else.', 'fail' => 'Could not reserve a version.',
                 'base' => 'This page is not edited. Add your version below.',
-                'stub' => 'This is your version. Copy from .0, then change this page. .0 cannot be edited.',
+                'stub' => 'This page is not public yet. Copy what you need from %s and paste it here, or write a new version and save. If you do not need this page, delete it.',
                 'shell' => 'Versions are listed below. The original is .0 and cannot be edited. Copy it into your own version.',
                 'copy' => 'This original cannot be edited. Copy it into your own version and change that.',
                 'staff' => 'Only a moderator or an administrator can add ~~TAKES~~.',
                 'cap' => 'Counting stops at one billion in either direction.',
-                'limit' => 'This topic already has 60000 versions.',
+                'limit' => 'This topic already has 100 million versions.',
+                'private' => 'Not public yet.',
                 'full' => 'Your watch list is full.',
                 'alert' => 'Notify me', 'alertset' => 'Notification on', 'alertoff' => 'Stop notices',
                 'hidden' => 'Hidden.', 'unhide' => 'Show again', 'missing' => 'This topic does not exist',
@@ -796,12 +871,13 @@ class action_plugin_takes extends ActionPlugin
                 'up' => '赞成', 'down' => '反对', 'empty' => '还没有别的说法。',
                 'taken' => '这是别人的说法，不能改。', 'fail' => '没有分到说法编号。',
                 'base' => '这个总页面不能改。要加说法，用下面的按钮。',
-                'stub' => '这是你的说法。原文在 .0，不能改。把原文复制过来再改。',
+                'stub' => '目前该页面不是公开状态，请手动到 %s 复制需要的内容粘贴到本页面或者重新撰写以上传。如果不需要本页面可以直接删除。',
                 'shell' => '各种说法列在下面。原来的内容在 .0，不能改。可以复制到你自己的说法里再改。',
                 'copy' => '这篇原文不能改。可以复制到你自己的说法里再改。',
                 'staff' => '只有版主或管理员可以加上 ~~TAKES~~。',
                 'cap' => '赞成和反对加在一起，到了十亿或者负十亿就不再计。',
-                'limit' => '这个主题的说法已经有 60000 个，不再分配。',
+                'limit' => '这个主题的说法已经有 1 亿个，不再分配。',
+                'private' => '还没有公开。',
                 'full' => '关注名额已经用完。',
                 'alert' => '到这个赞数或榜首时通知我', 'alertset' => '已设通知', 'alertoff' => '取消通知',
                 'hidden' => '已隐藏。', 'unhide' => '解除隐藏', 'missing' => '这个主题不存在',
@@ -815,12 +891,13 @@ class action_plugin_takes extends ActionPlugin
                 'up' => '贊成', 'down' => '反對', 'empty' => '還沒有別的說法。',
                 'taken' => '這是別人的說法，不能改。', 'fail' => '沒有分到說法編號。',
                 'base' => '這個總頁面不能改。要加說法，用下面的按鈕。',
-                'stub' => '這是你的說法。原文在 .0，不能改。把原文複製過來再改。',
+                'stub' => '目前該頁面不是公開狀態，請手動到 %s 複製需要的內容貼到本頁面或者重新撰寫以上傳。如果不需要本頁面可以直接刪除。',
                 'shell' => '各種說法列在下面。原來的內容在 .0，不能改。可以複製到你自己的說法裡再改。',
                 'copy' => '這篇原文不能改。可以複製到你自己的說法裡再改。',
                 'staff' => '只有版主或管理員可以加上 ~~TAKES~~。',
                 'cap' => '贊成和反對加在一起，到了十億或負十億就不再計。',
-                'limit' => '這個主題的說法已經有 60000 個，不再分配。',
+                'limit' => '這個主題的說法已經有 1 億個，不再分配。',
+                'private' => '還沒有公開。',
                 'full' => '訂閱名額已經用完。',
                 'alert' => '到這個讚數或榜首時通知我', 'alertset' => '已設通知', 'alertoff' => '取消通知',
                 'hidden' => '已隱藏。', 'unhide' => '解除隱藏', 'missing' => '這個主題不存在',
@@ -833,7 +910,19 @@ class action_plugin_takes extends ActionPlugin
                 'up' => 'Pour', 'down' => 'Contre', 'empty' => 'Pas encore de version.',
                 'taken' => 'Cette version appartient à quelqu\'un d\'autre.', 'fail' => 'Numéro non attribué.',
                 'base' => 'Cette page ne se modifie pas. Ajoutez une version plus bas.',
-                'stub' => 'Remplacez ce texte par votre version.', 'stubsum' => 'Version attribuée',
+                'stub' => 'Cette page n\'est pas encore publique. Copiez ce qu\'il vous faut depuis %s et collez-le ici, ou écrivez une nouvelle version et enregistrez. Si vous n\'en avez pas besoin, supprimez-la.',
+                'shell' => 'Les versions sont listées plus bas. L\'original est .0 et ne se modifie pas. Copiez-le dans votre version.',
+                'copy' => 'Cet original ne se modifie pas. Copiez-le dans votre version, puis changez-la.',
+                'staff' => 'Seul un modérateur ou un administrateur peut ajouter ~~TAKES~~.',
+                'cap' => 'Le compte s\'arrête à un milliard dans un sens comme dans l\'autre.',
+                'limit' => 'Ce sujet a déjà 100 millions de versions.',
+                'full' => 'Votre liste de suivi est pleine.',
+                'alert' => 'Me prévenir', 'alertset' => 'Alerte en place', 'alertoff' => 'Arrêter les alertes',
+                'hidden' => 'Masquée.', 'unhide' => 'Montrer à nouveau', 'missing' => 'Ce sujet n\'existe pas',
+                'buried' => 'Le total des voix pour et contre est de -20 ou moins, donc cette version est masquée. Vous pouvez la montrer à nouveau. Cet avis n\'est envoyé qu\'une fois.',
+                'peaked' => 'Cette version est passée en tête, ou a atteint le nombre de voix que vous aviez fixé.',
+                'empty0' => 'La page d\'origine était vide.',
+                'private' => 'Pas encore publique.',
             ],
             'de' => [
                 'title' => 'Fassungen', 'add' => 'Eigene Fassung hinzufügen', 'yours' => 'Ihre Fassung',
@@ -841,7 +930,19 @@ class action_plugin_takes extends ActionPlugin
                 'up' => 'Dafür', 'down' => 'Dagegen', 'empty' => 'Noch keine Fassung.',
                 'taken' => 'Diese Fassung gehört jemand anderem.', 'fail' => 'Keine Nummer vergeben.',
                 'base' => 'Diese Seite wird nicht bearbeitet. Eine Fassung fügen Sie unten hinzu.',
-                'stub' => 'Ersetzen Sie diesen Text durch Ihre Fassung.', 'stubsum' => 'Fassung zugeteilt',
+                'stub' => 'Diese Seite ist noch nicht öffentlich. Kopieren Sie aus %s, was Sie brauchen, und fügen Sie es hier ein, oder schreiben Sie neu und speichern Sie. Wenn Sie die Seite nicht brauchen, löschen Sie sie.',
+                'shell' => 'Die Fassungen stehen unten. Das Original ist .0 und wird nicht bearbeitet. Kopieren Sie es in Ihre Fassung.',
+                'copy' => 'Dieses Original wird nicht bearbeitet. Kopieren Sie es in Ihre Fassung und ändern Sie diese.',
+                'staff' => 'Nur ein Moderator oder ein Administrator kann ~~TAKES~~ setzen.',
+                'cap' => 'Gezählt wird bis zu einer Milliarde in beide Richtungen, dann nicht weiter.',
+                'limit' => 'Dieses Thema hat bereits 100 Millionen Fassungen.',
+                'full' => 'Die Beobachtungsliste ist voll.',
+                'alert' => 'Benachrichtigen', 'alertset' => 'Hinweis ist an', 'alertoff' => 'Hinweis aus',
+                'hidden' => 'Versteckt.', 'unhide' => 'Wieder zeigen', 'missing' => 'Dieses Thema gibt es nicht',
+                'buried' => 'Für und gegen zusammen sind bei -20 oder darunter, deshalb ist diese Fassung versteckt. Sie können sie wieder zeigen. Dieser Hinweis kommt nur einmal.',
+                'peaked' => 'Diese Fassung steht jetzt vorn, oder hat die von Ihnen gesetzte Zahl an Stimmen erreicht.',
+                'empty0' => 'Die ursprüngliche Seite war leer.',
+                'private' => 'Noch nicht öffentlich.',
             ],
             'es' => [
                 'title' => 'Versiones', 'add' => 'Añadir tu versión', 'yours' => 'Tu versión',
@@ -849,7 +950,19 @@ class action_plugin_takes extends ActionPlugin
                 'up' => 'A favor', 'down' => 'En contra', 'empty' => 'Todavía no hay versiones.',
                 'taken' => 'Esta versión es de otra persona.', 'fail' => 'No se pudo reservar un número.',
                 'base' => 'Esta página no se edita. Añada su versión debajo.',
-                'stub' => 'Sustituya este texto por su versión.', 'stubsum' => 'Versión asignada',
+                'stub' => 'Esta página todavía no es pública. Copie lo que necesite de %s y péguelo aquí, o escriba de nuevo y guarde. Si no la necesita, bórrrela.',
+                'shell' => 'Las versiones están abajo. El original es .0 y no se edita. Cópielo en su versión.',
+                'copy' => 'Este original no se edita. Cópielo en su versión y cámbiela.',
+                'staff' => 'Solo un moderador o un administrador puede añadir ~~TAKES~~.',
+                'cap' => 'La cuenta se detiene en mil millones, hacia arriba o hacia abajo.',
+                'limit' => 'Este tema ya tiene 100 millones de versiones.',
+                'full' => 'La lista de seguimiento está llena.',
+                'alert' => 'Avisarme', 'alertset' => 'Aviso puesto', 'alertoff' => 'Quitar aviso',
+                'hidden' => 'Oculta.', 'unhide' => 'Mostrar otra vez', 'missing' => 'Este tema no existe',
+                'buried' => 'Los votos a favor y en contra suman -20 o menos, así que esta versión está oculta. Puede mostrarla otra vez. Este aviso se envía solo una vez.',
+                'peaked' => 'Esta versión llegó al primer puesto, o al número de votos a favor que usted fijó.',
+                'empty0' => 'La página original estaba vacía.',
+                'private' => 'Todavía no es pública.',
             ],
             'ja' => [
                 'title' => '別の言い方', 'add' => '言い方を足す', 'yours' => '自分の言い方',
@@ -857,7 +970,19 @@ class action_plugin_takes extends ActionPlugin
                 'up' => '賛成', 'down' => '反対', 'empty' => 'まだ別の言い方はありません。',
                 'taken' => 'これは他の人の言い方なので、変更できません。', 'fail' => '番号を取れませんでした。',
                 'base' => 'このページ自体は編集できません。下のボタンから言い方を追加します。',
-                'stub' => 'この文を、自分の言い方に書き換えてください。', 'stubsum' => '言い方を割り当て',
+                'stub' => 'このページは、まだ公開されていません。%s から必要なところをコピーしてここに貼るか、書き直して保存してください。要らなければ、このページを削除できます。',
+                'shell' => '別の言い方は下に並びます。元の文章は .0 で、編集できません。自分の言い方へコピーしてください。',
+                'copy' => 'この原文は編集できません。自分の言い方へコピーしてから直してください。',
+                'staff' => '~~TAKES~~ を付けられるのは、モデレーターか管理者だけです。',
+                'cap' => '賛成と反対を合わせた数は、十億またはマイナス十億で止まります。',
+                'limit' => 'この話題の言い方は、すでに1億件あります。',
+                'full' => 'ウォッチの枠がいっぱいです。',
+                'alert' => '知らせを受け取る', 'alertset' => '知らせはオン', 'alertoff' => '知らせをやめる',
+                'hidden' => '非表示です。', 'unhide' => '再表示する', 'missing' => 'この話題はありません',
+                'buried' => '賛成と反対を合わせた数が -20 以下になったので、この言い方は隠しました。再表示できます。この知らせは一度だけです。',
+                'peaked' => 'この言い方が先頭になったか、設定した賛成数に達しました。',
+                'empty0' => '元のページは空でした。',
+                'private' => 'まだ公開されていません。',
             ],
         ];
         return $text[$lang][$key] ?? $text['en'][$key] ?? $key;
